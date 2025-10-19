@@ -37,7 +37,7 @@ export default function App() {
     lastName:  ru ? 'Фамилия' : 'Last name',
     truck:     ru ? 'Трак №' : 'Truck #',
     trailer:   ru ? 'Трейлер №' : 'Trailer #',
-    comment:   ru ? 'Комментарий / дефекты (опц.)' : 'Comments / defects (optional)',
+    comment:   ru ? 'Заметки / починки' : 'Notes / damages',
     useGeo:    ru ? 'Использовать текущую геолокацию' : 'Use current location',
     timeAuto:  ru ? 'Время (Америка/Чикаго)' : 'Time (America/Chicago)',
     next:      ru ? 'Далее' : 'Next',
