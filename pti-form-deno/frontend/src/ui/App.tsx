@@ -17,13 +17,14 @@ export default function App() {
   const [photos, setPhotos] = useState<PhotoItem[]>([])
   const [geoAllowed, setGeoAllowed] = useState(false)
   const [loc, setLoc] = useState<{lat?: number, lon?: number, accuracy?: number}>({})
-  const [busy, setBusy] = useState(false)
-  const [progress, setProgress] = useState('')
+  const [busyCompress, setBusyCompress] = useState(false)
+  const [busySend, setBusySend] = useState(false)
+  const [progress, setProgress] = useState({ compDone: 0, compTotal: 0, sendText: '' })
 
   const timeInfo = useMemo(() => toChicagoISO(), [])
-
   const ru = i18n.language.startsWith('ru')
-  const labels = {
+  const L = {
+    title: ru ? 'Pre-Trip Inspection' : 'Pre-Trip Inspection',
     firstName: ru ? 'Имя' : 'First name',
     lastName:  ru ? 'Фамилия' : 'Last name',
     truck:     ru ? 'Трак №' : 'Truck #',
@@ -35,9 +36,10 @@ export default function App() {
     back:      ru ? 'Назад' : 'Back',
     submit:    ru ? 'Отправить в Telegram' : 'Send to Telegram',
     photosMin: ru ? 'Добавьте минимум 20 фото' : 'Add at least 20 photos',
-    added:     ru ? 'добавлено' : 'added',
-    of:        ru ? 'из' : 'of',
-    title:     ru ? 'PTI осмотр' : 'Pre-Trip Inspection',
+    addPhotos: ru ? 'Добавить фото' : 'Add photos',
+    sending:   ru ? 'отправка' : 'sending',
+    compressing: ru ? 'сжатие' : 'compressing',
+    gpsOff: ru ? 'Геолокация не разрешена' : 'Location not allowed',
   }
 
   const LangSwitch = () => (
@@ -47,26 +49,28 @@ export default function App() {
     </div>
   )
 
+  // Progressive compression: create a worker per file and push as soon as ready
   const handleFiles = async (files: FileList | null) => {
     if (!files) return
-    setBusy(true)
-    const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
-    const compressed: PhotoItem[] = []
-    let processed = 0
-    await Promise.all(Array.from(files).map((file, idx) => new Promise<void>((resolve) => {
-      worker.onmessage = (e: MessageEvent) => {
-        const { base64, bytes, w, h, mime } = e.data
-        const name = `photo_${idx + 1}.webp`
-        compressed.push({ base64, bytes, w, h, mime, filename: name })
-        processed++
-        setProgress(`${processed}/${files.length}`)
-        resolve()
-      }
-      worker.postMessage({ file, quality: 0.72 })
-    })))
-    worker.terminate()
-    setPhotos(p => [...p, ...compressed])
-    setBusy(false)
+    const list = Array.from(files)
+    setBusyCompress(true)
+    setProgress({ compDone: 0, compTotal: list.length, sendText: '' })
+
+    for (let idx = 0; idx < list.length; idx++) {
+      await new Promise<void>((resolve) => {
+        const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
+        worker.onmessage = (e: MessageEvent) => {
+          const { base64, bytes, w, h, mime } = e.data
+          const name = `photo_${Date.now()}_${idx + 1}.webp`
+          setPhotos(prev => [...prev, { base64, bytes, w, h, mime, filename: name }])
+          setProgress(p => ({ ...p, compDone: p.compDone + 1 }))
+          worker.terminate()
+          resolve()
+        }
+        worker.postMessage({ file: list[idx], quality: 0.72 })
+      })
+    }
+    setBusyCompress(false)
   }
 
   const requestGeo = () => {
@@ -74,11 +78,7 @@ export default function App() {
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         setGeoAllowed(true)
-        setLoc({
-          lat: pos.coords.latitude,
-          lon: pos.coords.longitude,
-          accuracy: pos.coords.accuracy
-        })
+        setLoc({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy })
       },
       () => setGeoAllowed(false),
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
@@ -87,14 +87,14 @@ export default function App() {
 
   const canNext = () => {
     if (step === 0) return !!firstName && !!lastName && !!truck && !!trailer
-    if (step === 1) return photos.length >= 20
+    if (step === 1) return photos.length >= 20 // активна даже когда идёт компрессия
     return true
   }
 
   const submitAll = async () => {
-    setBusy(true)
+    setBusySend(true)
     try {
-      setProgress('summary')
+      setProgress(p => ({ ...p, sendText: 'summary' }))
       const payloadSummary = {
         driver: { firstName, lastName },
         unit: { truck, trailer },
@@ -111,33 +111,25 @@ export default function App() {
 
       const groups = chunk(photos, 10)
       for (let i = 0; i < groups.length; i++) {
-        setProgress(`group ${i+1}/${groups.length}`)
-        const media = groups[i].map((p) => ({
-          filename: p.filename,
-          mime: p.mime,
-          data: p.base64
-        }))
+        setProgress(p => ({ ...p, sendText: `${L.sending} ${i + 1}/${groups.length}` }))
+        const media = groups[i].map(p => ({ filename: p.filename, mime: p.mime, data: p.base64 }))
         const r = await fetch(import.meta.env.VITE_API_BASE + '/relay/group', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            unit: { truck, trailer },
-            index: i + 1,
-            total: groups.length,
-            media
-          })
+          body: JSON.stringify({ unit: { truck, trailer }, index: i + 1, total: groups.length, media })
         })
         if (!r.ok) throw new Error('group failed')
         await sleep(1500)
       }
       alert('ok')
-      setFirstName(''); setLastName(''); setTruck(''); setTrailer(''); setComment(''); setPhotos([])
-      setStep(0)
+      // reset
+      setFirstName(''); setLastName(''); setTruck(''); setTrailer(''); setComment('')
+      setPhotos([]); setStep(0)
     } catch {
       alert('error')
     } finally {
-      setBusy(false)
-      setProgress('')
+      setBusySend(false)
+      setProgress({ compDone: 0, compTotal: 0, sendText: '' })
     }
   }
 
@@ -145,30 +137,28 @@ export default function App() {
     <div className="min-h-screen p-3">
       <div className="max-w-sm mx-auto">
         <header className="flex items-center justify-between mb-3">
-          <h1 className="text-xl font-semibold">{labels.title}</h1>
+          <h1 className="text-xl font-semibold">{L.title}</h1>
           <LangSwitch />
         </header>
 
         <motion.div className="glass p-4">
-          {/* STEP 0: Driver & Unit, mobile-first */}
           {step === 0 && (
             <div className="flex flex-col gap-3">
-              <input className="glass p-3 w-full h-12 text-base" placeholder={labels.firstName} value={firstName} onChange={e=>setFirstName(e.target.value)} />
-              <input className="glass p-3 w-full h-12 text-base" placeholder={labels.lastName} value={lastName} onChange={e=>setLastName(e.target.value)} />
-              <input className="glass p-3 w-full h-12 text-base" placeholder={labels.truck} value={truck} onChange={e=>setTruck(e.target.value)} />
-              <input className="glass p-3 w-full h-12 text-base" placeholder={labels.trailer} value={trailer} onChange={e=>setTrailer(e.target.value)} />
-              <textarea className="glass p-3 w-full text-base min-h-[84px]" placeholder={labels.comment} value={comment} onChange={e=>setComment(e.target.value)} />
+              <input className="glass p-3 w-full h-12 text-base" placeholder={L.firstName} value={firstName} onChange={e=>setFirstName(e.target.value)} />
+              <input className="glass p-3 w-full h-12 text-base" placeholder={L.lastName} value={lastName} onChange={e=>setLastName(e.target.value)} />
+              <input className="glass p-3 w-full h-12 text-base" placeholder={L.truck} value={truck} onChange={e=>setTruck(e.target.value)} />
+              <input className="glass p-3 w-full h-12 text-base" placeholder={L.trailer} value={trailer} onChange={e=>setTrailer(e.target.value)} />
+              <textarea className="glass p-3 w-full text-base min-h-[84px]" placeholder={L.comment} value={comment} onChange={e=>setComment(e.target.value)} />
               <div className="text-sm opacity-80">
-                {labels.timeAuto}: <span className="font-mono">{timeInfo.human}</span>
+                {L.timeAuto}: <span className="font-mono">{timeInfo.human}</span>
               </div>
-              <button className="btn glass h-12" onClick={requestGeo}>{labels.useGeo}</button>
+              <button className="btn glass h-12" onClick={requestGeo}>{L.useGeo}</button>
             </div>
           )}
 
-          {/* STEP 1: Photos */}
           {step === 1 && (
             <div className="flex flex-col gap-3">
-              <div className="text-sm">{labels.photosMin}: <b>{photos.length}</b></div>
+              <div className="text-sm">{L.photosMin}: <b>{photos.length}</b></div>
               <label className="btn-primary w-full h-12 flex items-center justify-center cursor-pointer">
                 <input
                   type="file"
@@ -178,9 +168,13 @@ export default function App() {
                   className="hidden"
                   onChange={e => handleFiles(e.target.files)}
                 />
-                {ru ? 'Добавить фото' : 'Add photos'}
+                {L.addPhotos}
               </label>
-              {busy && <div className="text-sm">compressing {progress}</div>}
+              {(busyCompress || progress.compDone>0) && (
+                <div className="text-sm">
+                  {L.compressing} {progress.compDone}/{progress.compTotal || '?'}
+                </div>
+              )}
               <div className="grid grid-cols-3 gap-2">
                 {photos.map((p, i) => (
                   <div key={i} className="glass p-1 text-[10px]">
@@ -192,34 +186,47 @@ export default function App() {
             </div>
           )}
 
-          {/* STEP 2: Review */}
           {step === 2 && (
             <div className="flex flex-col gap-3">
               <div className="text-sm opacity-80">
                 {firstName} {lastName} • {truck}/{trailer} • {timeInfo.human}
               </div>
-              <div className="text-sm">{photos.length} {labels.of} 20+</div>
+              <div className="text-sm">{photos.length} {ru ? 'из' : 'of'} 20+</div>
               <div className="text-sm">{comment}</div>
               <div className="text-xs opacity-70">
                 {geoAllowed && loc.lat && loc.lon
                   ? `GPS: ${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)} (±${Math.round(loc.accuracy||0)}m)`
-                  : (ru ? 'Геолокация не разрешена' : 'Location not allowed')}
+                  : L.gpsOff}
               </div>
             </div>
           )}
 
-          {/* NAV */}
           <div className="flex justify-between mt-4">
-            {step > 0 ? (
-              <button className="btn glass h-12 px-5" disabled={busy} onClick={()=>setStep(s=>Math.max(0, s-1))}>{labels.back}</button>
-            ) : <div />}
+            {/* Назад всегда работает */}
+            <button className="btn glass h-12 px-5" onClick={()=>setStep(s=>Math.max(0, s-1))}>{L.back}</button>
+
             {step < 2 ? (
-              <button className="btn-primary h-12 px-5" disabled={!canNext()||busy} onClick={()=>setStep(s=>s+1)}>{labels.next}</button>
+              <button
+                className="btn-primary h-12 px-5"
+                disabled={!canNext() || busySend}
+                onClick={()=>setStep(s=>s+1)}
+              >
+                {L.next}
+              </button>
             ) : (
-              <button className="btn-primary h-12 px-5" disabled={busy || photos.length<20} onClick={submitAll}>{labels.submit}</button>
+              <button
+                className="btn-primary h-12 px-5"
+                disabled={busySend || photos.length<20}
+                onClick={submitAll}
+              >
+                {L.submit}
+              </button>
             )}
           </div>
-          {busy && <div className="mt-3 text-xs opacity-80">sending {progress}</div>}
+
+          {(busySend || progress.sendText) && (
+            <div className="mt-3 text-xs opacity-80">{progress.sendText}</div>
+          )}
         </motion.div>
       </div>
     </div>
