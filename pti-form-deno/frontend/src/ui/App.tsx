@@ -9,6 +9,7 @@ type PhotoItem = { base64: string, bytes: number, w: number, h: number, mime: st
 export default function App() {
   const { i18n } = useTranslation()
   const [step, setStep] = useState(0)
+
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [truck, setTruck] = useState('')
@@ -27,6 +28,7 @@ export default function App() {
   const [sendText, setSendText] = useState('')
   const [sentOk, setSentOk] = useState(false)
 
+  const [errorText, setErrorText] = useState<string>('') // текст ошибки без alert
   const fileInputRef = useRef<HTMLInputElement|null>(null)
 
   const timeInfo = useMemo(() => toChicagoISO(), [])
@@ -37,7 +39,7 @@ export default function App() {
     lastName:  ru ? 'Фамилия' : 'Last name',
     truck:     ru ? 'Трак №' : 'Truck #',
     trailer:   ru ? 'Трейлер №' : 'Trailer #',
-    comment:   ru ? 'Заметки / починки' : 'Notes / damages',
+    comment:   ru ? 'Комментарий / дефекты (опц.)' : 'Comments / defects (optional)',
     useGeo:    ru ? 'Использовать текущую геолокацию' : 'Use current location',
     timeAuto:  ru ? 'Время (Америка/Чикаго)' : 'Time (America/Chicago)',
     next:      ru ? 'Далее' : 'Next',
@@ -57,44 +59,69 @@ export default function App() {
     return true
   }
 
-  // ---- COMPRESSION (single worker, queued) ----
+  // ——— УСТОЙЧИВАЯ КОМПРЕССИЯ: воркер на файл + таймаут + ретрай ———
+  async function compressOneWithWorker(file: File, idx: number, quality = 0.6, maxW = 1280, maxH = 1280): Promise<PhotoItem> {
+    return new Promise<PhotoItem>((resolve, reject) => {
+      const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
+      const timer = setTimeout(() => {
+        worker.terminate()
+        reject(new Error('compress timeout'))
+      }, 15000)
+
+      worker.onmessage = (e: MessageEvent) => {
+        clearTimeout(timer)
+        const { base64, bytes, w, h, mime } = e.data
+        worker.terminate()
+        resolve({ base64, bytes, w, h, mime, filename: `photo_${Date.now()}_${idx+1}.webp` })
+      }
+      worker.onerror = () => {
+        clearTimeout(timer)
+        worker.terminate()
+        reject(new Error('compress error'))
+      }
+      worker.postMessage({ file, quality, maxW, maxH })
+    })
+  }
+
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return
+    setErrorText('')
     setSentOk(false)
+
     const list = Array.from(files)
     setBusyCompress(true)
     setCompDone(0)
     setCompTotal(list.length)
 
-    const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
-
-    const compressOne = (file: File, idx: number) =>
-      new Promise<PhotoItem>((resolve) => {
-        const onMsg = (e: MessageEvent) => {
-          const { base64, bytes, w, h, mime } = e.data
-          worker.removeEventListener('message', onMsg as any)
-          resolve({ base64, bytes, w, h, mime, filename: `photo_${Date.now()}_${idx+1}.webp` })
-        }
-        worker.addEventListener('message', onMsg as any, { once: true })
-        // снижены размер/качество для устойчивости на больших батчах
-        worker.postMessage({ file, quality: 0.6, maxW: 1280, maxH: 1280 })
-      })
-
     for (let i = 0; i < list.length; i++) {
-      const item = await compressOne(list[i], i)
-      setPhotos(prev => [...prev, item])
-      setCompDone(d => d + 1)
-      await new Promise(r => setTimeout(r, 0)) // отдать управление UI
+      try {
+        // 1-я попытка
+        let item = await compressOneWithWorker(list[i], i, 0.6, 1280, 1280)
+        // если > 300KB, чуть снизим качество, чтобы итоговые альбомы были легче
+        if (item.bytes > 300 * 1024) {
+          item = await compressOneWithWorker(list[i], i, 0.55, 1280, 1280)
+        }
+        setPhotos(prev => [...prev, item])
+        setCompDone(d => d + 1)
+      } catch {
+        // Ретрай с ещё меньшим качеством
+        try {
+          const item = await compressOneWithWorker(list[i], i, 0.5, 1024, 1024)
+          setPhotos(prev => [...prev, item])
+          setCompDone(d => d + 1)
+        } catch (e) {
+          setErrorText(`Ошибка сжатия файла #${i+1}`)
+        }
+      }
+      // отдаём управление UI
+      await new Promise(r => setTimeout(r, 0))
     }
 
-    worker.terminate()
     setBusyCompress(false)
-
-    // очистить value, чтобы повторный выбор тех же файлов сработал
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  // ---- GEO ----
+  // ——— GEO ———
   const requestGeo = () => {
     if (!navigator.geolocation) return
     navigator.geolocation.getCurrentPosition(
@@ -107,10 +134,11 @@ export default function App() {
     )
   }
 
-  // ---- SUBMIT ----
+  // ——— SUBMIT ———
   const submitAll = async () => {
     setBusySend(true)
     setSentOk(false)
+    setErrorText('')
     try {
       setSendText('summary')
       const payloadSummary = {
@@ -140,11 +168,9 @@ export default function App() {
         await sleep(1500)
       }
 
-      setSentOk(true)
-      alert('ok')
-      // не сбрасываем форму сразу, чтобы видеть зелёную кнопку «Отправлено!»
+      setSentOk(true) // зелёная кнопка «Отправлено!»
     } catch (e:any) {
-      alert(typeof e === 'string' ? e : (e?.message || 'error'))
+      setErrorText(typeof e === 'string' ? e : (e?.message || 'error'))
     } finally {
       setBusySend(false)
       setSendText('')
@@ -152,7 +178,9 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen p-3">
+    <div className="min-h-screen p-3"
+      style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Inter, Roboto, system-ui, Segoe UI, Arial, sans-serif' }}
+    >
       <div className="max-w-sm mx-auto">
         <header className="flex items-center justify-between mb-3">
           <h1 className="text-xl font-semibold">{L.title}</h1>
@@ -239,7 +267,19 @@ export default function App() {
               )}
             </div>
           )}
+
+          {errorText && <div className="mt-3 text-xs text-red-400">{errorText}</div>}
         </motion.div>
+
+        {/* Footer */}
+        <footer className="mt-6 mb-2 text-center">
+          <div
+            className="text-sm"
+            style={{ fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, system-ui, Segoe UI, Arial, sans-serif', fontWeight: 700 }}
+          >
+            “ It's our duty to lead people to the light ” — D. Miller
+          </div>
+        </footer>
       </div>
     </div>
   )
