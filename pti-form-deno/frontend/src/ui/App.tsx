@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useRef } from 'react'
+import React, { useMemo, useRef, useState } from 'react'
 import '../i18n'
 import { useTranslation } from 'react-i18next'
 import { motion } from 'framer-motion'
@@ -18,8 +18,6 @@ export default function App() {
 
   const [photos, setPhotos] = useState<PhotoItem[]>([])
   const [busyCompress, setBusyCompress] = useState(false)
-  const [compDone, setCompDone] = useState(0)
-  const [compTotal, setCompTotal] = useState(0)
 
   const [geoAllowed, setGeoAllowed] = useState(false)
   const [loc, setLoc] = useState<{lat?: number, lon?: number, accuracy?: number}>({})
@@ -27,12 +25,12 @@ export default function App() {
   const [busySend, setBusySend] = useState(false)
   const [sendText, setSendText] = useState('')
   const [sentOk, setSentOk] = useState(false)
+  const [errorText, setErrorText] = useState<string>('')
 
-  const [errorText, setErrorText] = useState<string>('') // текст ошибки без alert
   const fileInputRef = useRef<HTMLInputElement|null>(null)
-
   const timeInfo = useMemo(() => toChicagoISO(), [])
   const ru = i18n.language.startsWith('ru')
+
   const L = {
     title: 'Pre-Trip Inspection',
     firstName: ru ? 'Имя' : 'First name',
@@ -49,7 +47,6 @@ export default function App() {
     photosMin: ru ? 'Добавьте минимум 20 фото' : 'Add at least 20 photos',
     addPhotos: ru ? 'Добавить фото' : 'Add photos',
     gpsOff:    ru ? 'Геолокация не разрешена' : 'Location not allowed',
-    compressing: ru ? 'сжатие' : 'compressing',
     sending:   ru ? 'отправка' : 'sending',
   }
 
@@ -59,14 +56,11 @@ export default function App() {
     return true
   }
 
-  // ——— УСТОЙЧИВАЯ КОМПРЕССИЯ: воркер на файл + таймаут + ретрай ———
-  async function compressOneWithWorker(file: File, idx: number, quality = 0.6, maxW = 1280, maxH = 1280): Promise<PhotoItem> {
+  // ---------- FAST, ROBUST COMPRESSION (worker pool) ----------
+  function compressOnce(file: File, idx: number, quality: number, maxW: number, maxH: number, timeoutMs = 12000): Promise<PhotoItem> {
     return new Promise<PhotoItem>((resolve, reject) => {
       const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
-      const timer = setTimeout(() => {
-        worker.terminate()
-        reject(new Error('compress timeout'))
-      }, 15000)
+      const timer = setTimeout(() => { worker.terminate(); reject(new Error('timeout')) }, timeoutMs)
 
       worker.onmessage = (e: MessageEvent) => {
         clearTimeout(timer)
@@ -74,12 +68,44 @@ export default function App() {
         worker.terminate()
         resolve({ base64, bytes, w, h, mime, filename: `photo_${Date.now()}_${idx+1}.webp` })
       }
-      worker.onerror = () => {
-        clearTimeout(timer)
-        worker.terminate()
-        reject(new Error('compress error'))
-      }
+      worker.onerror = () => { clearTimeout(timer); worker.terminate(); reject(new Error('worker error')) }
       worker.postMessage({ file, quality, maxW, maxH })
+    })
+  }
+
+  async function compressWithRetry(file: File, idx: number): Promise<PhotoItem> {
+    // агрессивные размеры/качества для скорости и веса
+    const presets = [
+      { q: 0.62, w: 1280, h: 1280 },
+      { q: 0.55, w: 1280, h: 1280 },
+      { q: 0.5,  w: 1024, h: 1024 },
+      { q: 0.45, w: 1024, h: 1024 },
+    ]
+    for (let p of presets) {
+      try {
+        const item = await compressOnce(file, idx, p.q, p.w, p.h)
+        return item
+      } catch { /* retry next preset */ }
+    }
+    // последний форс
+    return await compressOnce(file, idx, 0.4, 960, 960, 8000)
+  }
+
+  async function runPool<T>(tasks: (() => Promise<T>)[], concurrency: number, onEach?: (res: T, i: number) => void) {
+    return new Promise<void>((resolve) => {
+      let i = 0, active = 0
+      const kick = () => {
+        while (active < concurrency && i < tasks.length) {
+          const cur = i++
+          active++
+          tasks[cur]().then(res => onEach?.(res, cur)).finally(() => {
+            active--
+            if (i >= tasks.length && active === 0) resolve()
+            else kick()
+          })
+        }
+      }
+      kick()
     })
   }
 
@@ -87,95 +113,77 @@ export default function App() {
     if (!files || files.length === 0) return
     setErrorText('')
     setSentOk(false)
+    setBusyCompress(true)
 
     const list = Array.from(files)
-    setBusyCompress(true)
-    setCompDone(0)
-    setCompTotal(list.length)
+    const tasks = list.map((f, idx) => async () => {
+      const item = await compressWithRetry(f, idx)
+      setPhotos(prev => [...prev, item])
+    })
 
-    for (let i = 0; i < list.length; i++) {
-      try {
-        // 1-я попытка
-        let item = await compressOneWithWorker(list[i], i, 0.6, 1280, 1280)
-        // если > 300KB, чуть снизим качество, чтобы итоговые альбомы были легче
-        if (item.bytes > 300 * 1024) {
-          item = await compressOneWithWorker(list[i], i, 0.55, 1280, 1280)
-        }
-        setPhotos(prev => [...prev, item])
-        setCompDone(d => d + 1)
-      } catch {
-        // Ретрай с ещё меньшим качеством
-        try {
-          const item = await compressOneWithWorker(list[i], i, 0.5, 1024, 1024)
-          setPhotos(prev => [...prev, item])
-          setCompDone(d => d + 1)
-        } catch (e) {
-          setErrorText(`Ошибка сжатия файла #${i+1}`)
-        }
-      }
-      // отдаём управление UI
-      await new Promise(r => setTimeout(r, 0))
-    }
-
+    // Пул из 6 воркеров: быстро и без залипаний на 40–50 фото
+    await runPool(tasks, 6)
     setBusyCompress(false)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  // ——— GEO ———
+  // ---------- GEO ----------
   const requestGeo = () => {
     if (!navigator.geolocation) return
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setGeoAllowed(true)
-        setLoc({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy })
-      },
+      (pos) => { setGeoAllowed(true); setLoc({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy }) },
       () => setGeoAllowed(false),
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
     )
   }
 
-  // ——— SUBMIT ———
+  // ---------- SUBMIT ----------
   const submitAll = async () => {
-    setBusySend(true)
-    setSentOk(false)
-    setErrorText('')
+    setBusySend(true); setSentOk(false); setErrorText('')
     try {
+      // summary
       setSendText('summary')
       const payloadSummary = {
         driver: { firstName, lastName },
         unit: { truck, trailer },
-        comment,
-        time: timeInfo,
+        comment, time: timeInfo,
         location: { ...loc, method: geoAllowed ? 'geolocation' : 'none' }
       }
       const r1 = await fetch(import.meta.env.VITE_API_BASE + '/relay/summary', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payloadSummary)
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payloadSummary)
       })
       if (!r1.ok) throw new Error(await r1.text())
 
+      // groups
       const groups = chunk(photos, 10)
       for (let i = 0; i < groups.length; i++) {
         setSendText(`${L.sending} ${i + 1}/${groups.length}`)
         const media = groups[i].map(p => ({ filename: p.filename, mime: p.mime, data: p.base64 }))
         const r = await fetch(import.meta.env.VITE_API_BASE + '/relay/group', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ unit: { truck, trailer }, index: i + 1, total: groups.length, media })
         })
         if (!r.ok) throw new Error(await r.text())
         await sleep(1500)
       }
-
-      setSentOk(true) // зелёная кнопка «Отправлено!»
+      setSentOk(true)
     } catch (e:any) {
       setErrorText(typeof e === 'string' ? e : (e?.message || 'error'))
     } finally {
-      setBusySend(false)
-      setSendText('')
+      setBusySend(false); setSendText('')
     }
   }
+
+  // ---------- UI ----------
+  const Spinner = () => (
+    <div className="flex justify-center py-2">
+      <div className="relative w-6 h-6">
+        <div className="absolute inset-0 rounded-full opacity-30 animate-ping bg-white"></div>
+        <div className="absolute inset-0 rounded-full border-2 border-t-transparent animate-spin"
+             style={{ borderColor: 'rgba(255,255,255,0.35)', borderTopColor: 'transparent' }} />
+      </div>
+    </div>
+  )
 
   return (
     <div className="min-h-screen p-3"
@@ -228,9 +236,8 @@ export default function App() {
                 />
                 {L.addPhotos}
               </label>
-              {(busyCompress || compDone>0) && (
-                <div className="text-sm">{L.compressing} {compDone}/{compTotal || '?'}</div>
-              )}
+
+              {busyCompress && <Spinner />}
 
               <div className="flex justify-between mt-2">
                 <button className="btn glass h-12 px-5" onClick={()=>setStep(0)}>{L.back}</button>
@@ -262,16 +269,13 @@ export default function App() {
                 </button>
               </div>
 
-              {(busySend || sendText) && (
-                <div className="mt-3 text-xs opacity-80">{sendText}</div>
-              )}
+              {(busySend || sendText) && <Spinner />}
             </div>
           )}
 
           {errorText && <div className="mt-3 text-xs text-red-400">{errorText}</div>}
         </motion.div>
 
-        {/* Footer */}
         <footer className="mt-6 mb-2 text-center">
           <div
             className="text-sm"
