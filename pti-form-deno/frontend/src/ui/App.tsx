@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import '../i18n'
 import { useTranslation } from 'react-i18next'
 import { motion } from 'framer-motion'
@@ -26,6 +26,16 @@ export default function App() {
   const [sendText, setSendText] = useState('')
   const [sentOk, setSentOk]     = useState(false)
   const [errorText, setErrorText] = useState('')
+
+  const [dots, setDots] = useState('') // анимированные точки
+
+  useEffect(() => {
+    if (!busyCompress && !busySend) { setDots(''); return }
+    const id = setInterval(() => {
+      setDots(prev => prev.length >= 3 ? '' : prev + '.')
+    }, 400)
+    return () => clearInterval(id)
+  }, [busyCompress, busySend])
 
   const fileInputRef = useRef<HTMLInputElement|null>(null)
   const timeInfo = useMemo(() => toChicagoISO(), [])
@@ -56,7 +66,7 @@ export default function App() {
     return true
   }
 
-  // ---------- компрессия: пул воркеров ----------
+  // ---------- FAST COMPRESSION (worker pool) ----------
   function compressOnce(file: File, idx: number, quality: number, maxW: number, maxH: number, timeoutMs = 12000): Promise<PhotoItem> {
     return new Promise<PhotoItem>((resolve, reject) => {
       const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
@@ -106,7 +116,7 @@ export default function App() {
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
-  // ---------- гео ----------
+  // ---------- GEO ----------
   const requestGeo = () => {
     if (!navigator.geolocation) return
     navigator.geolocation.getCurrentPosition(
@@ -116,7 +126,7 @@ export default function App() {
     )
   }
 
-  // ---------- отправка ----------
+  // ---------- SUBMIT ----------
   const submitAll = async () => {
     setBusySend(true); setSentOk(false); setErrorText('')
     try {
@@ -151,37 +161,32 @@ export default function App() {
     }
   }
 
+  // ---------- UI ----------
   const Spinner = () => (
-    <div className="flex justify-center py-2">
-      <div className="relative w-6 h-6">
+    <div className="flex flex-col items-center py-2">
+      <div className="relative w-6 h-6 mb-1">
         <div className="absolute inset-0 rounded-full opacity-30 animate-ping bg-white"></div>
         <div className="absolute inset-0 rounded-full border-2 border-t-transparent animate-spin"
              style={{borderColor:'rgba(255,255,255,0.35)', borderTopColor:'transparent'}} />
       </div>
+      <div className="text-xs opacity-80">
+        {ru ? `Загрузка фотографий, подождите${dots}` : `Uploading photos, please wait${dots}`}
+      </div>
     </div>
   )
 
+  // English checklist — показываем и в RU
   const checklistEN = [
-    'Truck front & both sides',
-    'Trailer front & both sides',
-    'All wheels (full set)',
-    'Tires: tread / damage / pressure caps',
+    'Truck: front & both sides',
+    'Trailer: front & both sides',
+    'All tires (full set)',
+    'Tires: tread / damage / valve caps',
     'Lights, reflectors, turn signals',
     'Undercarriage, air lines, hoses',
-    'Documents: registration, insurance, permits',
+    'Documents: registration + annuals (truck & trailer)',
     'Defects close-ups'
   ]
-  const checklistRU = [
-    'Тягач: спереди и обе стороны',
-    'Прицеп: спереди и обе стороны',
-    'Все колёса (полный комплект)',
-    'Шины: протектор / повреждения / колпачки',
-    'Фары, отражатели, поворотники',
-    'Низ, воздух/шланги/соединения',
-    'Документы: регистрация, страховка, пермиты',
-    'Дефекты крупным планом'
-  ]
-  const checklist = ru ? checklistRU : checklistEN
+  const checklist = checklistEN
 
   return (
     <div className="min-h-screen p-3"
@@ -220,7 +225,6 @@ export default function App() {
             <div className="flex flex-col gap-3">
               <div className="text-sm">{L.photosMin}: <b>{photos.length}</b></div>
 
-              {/* чек-лист */}
               <div className="glass p-3 text-sm leading-tight">
                 <div className="opacity-80 mb-1">{ru ? 'Сфотографируйте обязательно:' : 'Please capture:'}</div>
                 <ul className="list-disc pl-5 space-y-1">
@@ -241,7 +245,7 @@ export default function App() {
                 {L.addPhotos}
               </label>
 
-              {busyCompress && <Spinner />}
+              {(busyCompress) && <Spinner />}
 
               <div className="flex justify-between mt-2">
                 <button className="btn glass h-12 px-5" onClick={()=>setStep(0)}>{L.back}</button>
