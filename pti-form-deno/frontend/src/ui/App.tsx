@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useMemo, useState, useRef } from 'react'
 import '../i18n'
 import { useTranslation } from 'react-i18next'
 import { motion } from 'framer-motion'
@@ -14,14 +14,20 @@ export default function App() {
   const [truck, setTruck] = useState('')
   const [trailer, setTrailer] = useState('')
   const [comment, setComment] = useState('')
+
   const [photos, setPhotos] = useState<PhotoItem[]>([])
-  const [geoAllowed, setGeoAllowed] = useState(false)
-  const [loc, setLoc] = useState<{lat?: number, lon?: number, accuracy?: number}>({})
   const [busyCompress, setBusyCompress] = useState(false)
-  const [busySend, setBusySend] = useState(false)
   const [compDone, setCompDone] = useState(0)
   const [compTotal, setCompTotal] = useState(0)
+
+  const [geoAllowed, setGeoAllowed] = useState(false)
+  const [loc, setLoc] = useState<{lat?: number, lon?: number, accuracy?: number}>({})
+
+  const [busySend, setBusySend] = useState(false)
   const [sendText, setSendText] = useState('')
+  const [sentOk, setSentOk] = useState(false)
+
+  const fileInputRef = useRef<HTMLInputElement|null>(null)
 
   const timeInfo = useMemo(() => toChicagoISO(), [])
   const ru = i18n.language.startsWith('ru')
@@ -37,6 +43,7 @@ export default function App() {
     next:      ru ? 'Далее' : 'Next',
     back:      ru ? 'Назад' : 'Back',
     submit:    ru ? 'Отправить в Telegram' : 'Send to Telegram',
+    submitted: ru ? 'Отправлено!' : 'Sent!',
     photosMin: ru ? 'Добавьте минимум 20 фото' : 'Add at least 20 photos',
     addPhotos: ru ? 'Добавить фото' : 'Add photos',
     gpsOff:    ru ? 'Геолокация не разрешена' : 'Location not allowed',
@@ -44,59 +51,66 @@ export default function App() {
     sending:   ru ? 'отправка' : 'sending',
   }
 
-  const LangSwitch = () => (
-    <div className="flex gap-2 items-center">
-      <button className="btn glass px-3 py-1" onClick={() => i18n.changeLanguage('ru')}>RU</button>
-      <button className="btn glass px-3 py-1" onClick={() => i18n.changeLanguage('en')}>EN</button>
-    </div>
-  )
+  const canNext = () => {
+    if (step === 0) return !!firstName && !!lastName && !!truck && !!trailer
+    if (step === 1) return photos.length >= 20
+    return true
+  }
 
-  // Robust sequential compression to avoid dropped files
+  // ---- COMPRESSION (single worker, queued) ----
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return
+    setSentOk(false)
     const list = Array.from(files)
     setBusyCompress(true)
     setCompDone(0)
     setCompTotal(list.length)
 
-    for (let idx = 0; idx < list.length; idx++) {
-      // process sequentially in a dedicated worker
-      await new Promise<void>((resolve) => {
-        const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
-        worker.onmessage = (e: MessageEvent) => {
+    const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
+
+    const compressOne = (file: File, idx: number) =>
+      new Promise<PhotoItem>((resolve) => {
+        const onMsg = (e: MessageEvent) => {
           const { base64, bytes, w, h, mime } = e.data
-          const name = `photo_${Date.now()}_${idx + 1}.webp`
-          setPhotos(prev => [...prev, { base64, bytes, w, h, mime, filename: name }])
-          setCompDone(d => d + 1)
-          worker.terminate()
-          resolve()
+          worker.removeEventListener('message', onMsg as any)
+          resolve({ base64, bytes, w, h, mime, filename: `photo_${Date.now()}_${idx+1}.webp` })
         }
-        // slightly lower quality to reduce size spikes on large batches
-        worker.postMessage({ file: list[idx], quality: 0.65, maxW: 1600, maxH: 1600 })
+        worker.addEventListener('message', onMsg as any, { once: true })
+        // снижены размер/качество для устойчивости на больших батчах
+        worker.postMessage({ file, quality: 0.6, maxW: 1280, maxH: 1280 })
       })
-      // yield to UI
-      await new Promise(r => setTimeout(r, 0))
+
+    for (let i = 0; i < list.length; i++) {
+      const item = await compressOne(list[i], i)
+      setPhotos(prev => [...prev, item])
+      setCompDone(d => d + 1)
+      await new Promise(r => setTimeout(r, 0)) // отдать управление UI
     }
+
+    worker.terminate()
     setBusyCompress(false)
+
+    // очистить value, чтобы повторный выбор тех же файлов сработал
+    if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
+  // ---- GEO ----
   const requestGeo = () => {
     if (!navigator.geolocation) return
     navigator.geolocation.getCurrentPosition(
-      (pos) => { setGeoAllowed(true); setLoc({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy }) },
+      (pos) => {
+        setGeoAllowed(true)
+        setLoc({ lat: pos.coords.latitude, lon: pos.coords.longitude, accuracy: pos.coords.accuracy })
+      },
       () => setGeoAllowed(false),
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
     )
   }
 
-  const canNext = () => {
-    if (step === 0) return !!firstName && !!lastName && !!truck && !!trailer
-    if (step === 1) return photos.length >= 20    // можно идти далее даже если компрессия ещё крутится
-    return true
-  }
-
+  // ---- SUBMIT ----
   const submitAll = async () => {
     setBusySend(true)
+    setSentOk(false)
     try {
       setSendText('summary')
       const payloadSummary = {
@@ -125,10 +139,10 @@ export default function App() {
         if (!r.ok) throw new Error(await r.text())
         await sleep(1500)
       }
+
+      setSentOk(true)
       alert('ok')
-      // reset
-      setFirstName(''); setLastName(''); setTruck(''); setTrailer(''); setComment('')
-      setPhotos([]); setStep(0)
+      // не сбрасываем форму сразу, чтобы видеть зелёную кнопку «Отправлено!»
     } catch (e:any) {
       alert(typeof e === 'string' ? e : (e?.message || 'error'))
     } finally {
@@ -142,7 +156,10 @@ export default function App() {
       <div className="max-w-sm mx-auto">
         <header className="flex items-center justify-between mb-3">
           <h1 className="text-xl font-semibold">{L.title}</h1>
-          <LangSwitch />
+          <div className="flex gap-2 items-center">
+            <button className="btn glass px-3 py-1" onClick={() => i18n.changeLanguage('ru')}>RU</button>
+            <button className="btn glass px-3 py-1" onClick={() => i18n.changeLanguage('en')}>EN</button>
+          </div>
         </header>
 
         <motion.div className="glass p-4">
@@ -156,7 +173,12 @@ export default function App() {
               <div className="text-sm opacity-80">
                 {L.timeAuto}: <span className="font-mono">{timeInfo.human}</span>
               </div>
-              <button className="btn glass h-12" onClick={requestGeo}>{L.useGeo}</button>
+              <button
+                className={`btn h-12 ${geoAllowed ? 'bg-green-600 text-white' : 'glass'}`}
+                onClick={requestGeo}
+              >
+                {L.useGeo}
+              </button>
               <div className="flex justify-end">
                 <button className="btn-primary h-12 px-5" disabled={!canNext() || busySend} onClick={()=>setStep(1)}>{L.next}</button>
               </div>
@@ -168,6 +190,7 @@ export default function App() {
               <div className="text-sm">{L.photosMin}: <b>{photos.length}</b></div>
               <label className="btn-primary w-full h-12 flex items-center justify-center cursor-pointer">
                 <input
+                  ref={fileInputRef}
                   type="file"
                   accept="image/*"
                   capture="environment"
@@ -180,14 +203,6 @@ export default function App() {
               {(busyCompress || compDone>0) && (
                 <div className="text-sm">{L.compressing} {compDone}/{compTotal || '?'}</div>
               )}
-              <div className="grid grid-cols-3 gap-2">
-                {photos.map((p, i) => (
-                  <div key={i} className="glass p-1 text-[10px]">
-                    <img className="w-full h-24 object-cover rounded-lg" src={`data:${p.mime};base64,${p.base64}`} />
-                    <div className="mt-1 opacity-80">{Math.round(p.bytes/1024)} KB</div>
-                  </div>
-                ))}
-              </div>
 
               <div className="flex justify-between mt-2">
                 <button className="btn glass h-12 px-5" onClick={()=>setStep(0)}>{L.back}</button>
@@ -202,16 +217,21 @@ export default function App() {
                 {firstName} {lastName} • {truck}/{trailer} • {timeInfo.human}
               </div>
               <div className="text-sm">{photos.length} {ru ? 'из' : 'of'} 20+</div>
-              <div className="text-sm">{comment}</div>
               <div className="text-xs opacity-70">
                 {geoAllowed && loc.lat && loc.lon
-                  ? `GPS: ${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)} (±${Math.round(loc.accuracy||0)}m)`
+                  ? `GPS: ${loc.lat?.toFixed(5)}, ${loc.lon?.toFixed(5)} (±${Math.round(loc.accuracy||0)}m)`
                   : L.gpsOff}
               </div>
 
               <div className="flex justify-between mt-2">
                 <button className="btn glass h-12 px-5" onClick={()=>setStep(1)}>{L.back}</button>
-                <button className="btn-primary h-12 px-5" disabled={busySend || photos.length<20} onClick={submitAll}>{L.submit}</button>
+                <button
+                  className={`h-12 px-5 rounded-xl transition ${sentOk ? 'bg-green-600 text-white' : 'btn-primary'}`}
+                  disabled={busySend || photos.length<20}
+                  onClick={submitAll}
+                >
+                  {sentOk ? L.submitted : L.submit}
+                </button>
               </div>
 
               {(busySend || sendText) && (
