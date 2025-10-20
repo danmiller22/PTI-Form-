@@ -18,6 +18,7 @@ export default function App() {
 
   const [photos, setPhotos]       = useState<PhotoItem[]>([])
   const [busyCompress, setBusyCompress] = useState(false)
+  const [failed, setFailed]       = useState<number>(0)
 
   const [geoAllowed, setGeoAllowed] = useState(false)
   const [loc, setLoc] = useState<{lat?: number, lon?: number, accuracy?: number}>({})
@@ -63,6 +64,52 @@ export default function App() {
     return true
   }
 
+  // ---------- helpers ----------
+  function dataURLtoBase64(dataUrl: string) {
+    return dataUrl.split(',')[1] ?? ''
+  }
+  function canvasScaleDims(sw: number, sh: number, maxW: number, maxH: number) {
+    const r = Math.min(maxW / sw, maxH / sh, 1)
+    return { w: Math.round(sw * r), h: Math.round(sh * r) }
+  }
+
+  // fallback компрессия в главном потоке (на случай проблем с воркером/таймаутом/HEIC)
+  async function fallbackCompress(file: File, idx: number, q = 0.5, maxW = 1200, maxH = 1200): Promise<PhotoItem> {
+    const buf = await file.arrayBuffer()
+    const blob = new Blob([buf])
+    const bitmap = await createImageBitmap(blob).catch(async () => {
+      const img = new Image()
+      const url = URL.createObjectURL(file)
+      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = url })
+      const canvas = document.createElement('canvas')
+      const ctx = canvas.getContext('2d')!
+      const { width: sw, height: sh } = img
+      const { w, h } = canvasScaleDims(sw, sh, maxW, maxH)
+      canvas.width = w; canvas.height = h
+      ctx.drawImage(img, 0, 0, w, h)
+      const out = canvas.toDataURL('image/webp', q)
+      URL.revokeObjectURL(url)
+      return { out, w, h }
+    })
+    if (bitmap instanceof ImageBitmap) {
+      const { w, h } = canvasScaleDims(bitmap.width, bitmap.height, maxW, maxH)
+      const canvas = new OffscreenCanvas(w, h)
+      const ctx = canvas.getContext('2d')!
+      ctx.drawImage(bitmap, 0, 0, w, h)
+      const blob = await canvas.convertToBlob({ type: 'image/webp', quality: q })
+      const base64 = await blob.arrayBuffer().then(b => b as ArrayBuffer).then(b => {
+        let binary = ''; const bytes = new Uint8Array(b)
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i])
+        return btoa(binary)
+      })
+      return { base64, bytes: blob.size, w, h, mime: 'image/webp', filename: `photo_${Date.now()}_${idx+1}.webp` }
+    } else {
+      const { out, w, h }: any = bitmap
+      const base64 = dataURLtoBase64(out)
+      return { base64, bytes: Math.floor((out.length * 3) / 4), w, h, mime: 'image/webp', filename: `photo_${Date.now()}_${idx+1}.webp` }
+    }
+  }
+
   // ---------- FAST COMPRESSION (adaptive, worker pool) ----------
   function compressOnce(file: File, idx: number, quality: number, maxW: number, maxH: number, timeoutMs = 10000): Promise<PhotoItem> {
     return new Promise<PhotoItem>((resolve, reject) => {
@@ -80,27 +127,34 @@ export default function App() {
   }
 
   async function compressAuto(file: File, idx: number, targetKB = 200): Promise<PhotoItem> {
-    // старт быстро: 1200px, q=0.6
     let w = 1200, h = 1200, q = 0.6
     for (let pass = 0; pass < 4; pass++) {
-      const item = await compressOnce(file, idx, q, w, h)
-      if (item.bytes <= targetKB * 1024) return item
-      // уменьшать агрессивно
-      if (pass === 0) q = 0.52
-      else if (pass === 1) { q = 0.46; w = h = 1024 }
-      else { q = 0.42; w = h = 960 }
+      try {
+        const item = await compressOnce(file, idx, q, w, h)
+        if (item.bytes <= targetKB * 1024) return item
+        if (pass === 0) q = 0.52
+        else if (pass === 1) { q = 0.46; w = h = 1024 }
+        else { q = 0.42; w = h = 960 }
+      } catch {
+        // если воркер упал — fallback
+        return await fallbackCompress(file, idx, 0.5, 1200, 1200)
+      }
     }
-    return await compressOnce(file, idx, 0.4, 900, 900, 9000)
+    // последний шанс
+    try { return await compressOnce(file, idx, 0.4, 900, 900, 9000) }
+    catch { return await fallbackCompress(file, idx, 0.42, 1000, 1000) }
   }
 
-  async function runPool<T>(tasks: (() => Promise<T>)[], concurrency: number, onEach?: (res: T)=>void) {
+  async function runPool<T>(tasks: (() => Promise<T>)[], concurrency: number, onEach?: (res: T)=>void, onFail?: ()=>void) {
     return new Promise<void>((resolve) => {
       let i = 0, active = 0
       const kick = () => {
         while (active < concurrency && i < tasks.length) {
           const t = tasks[i++]
           active++
-          t().then(r => onEach?.(r)).finally(() => { active--; if (i>=tasks.length && active===0) resolve(); else kick(); })
+          t().then(r => onEach?.(r)).catch(()=>onFail?.()).finally(() => {
+            active--; if (i>=tasks.length && active===0) resolve(); else kick()
+          })
         }
       }
       kick()
@@ -109,10 +163,19 @@ export default function App() {
 
   const handleFiles = async (files: FileList | null) => {
     if (!files?.length) return
-    setErrorText(''); setSentOk(false); setBusyCompress(true)
-    const list = Array.from(files)
-    const conc = Math.min(8, (navigator as any).hardwareConcurrency || 6) // быстрее
-    const tasks = list.map((f, idx)=> () => compressAuto(f, idx, 200).then(item => setPhotos(p=>[...p,item])))
+    setErrorText(''); setSentOk(false); setBusyCompress(true); setFailed(0)
+    const list = Array.from(files).filter(f => /^image\//i.test(f.type) || f.name.toLowerCase().endsWith('.heic') || f.name.toLowerCase().endsWith('.heif'))
+    const conc = Math.min(8, (navigator as any).hardwareConcurrency || 6)
+    const tasks = list.map((f, idx)=> () =>
+      compressAuto(f, idx, 200)
+        .then(item => setPhotos(p=>[...p,item]))
+        .catch(async ()=>{ // ещё одна аварийная попытка
+          try {
+            const item = await fallbackCompress(f, idx, 0.45, 1100, 1100)
+            setPhotos(p=>[...p,item])
+          } catch { setFailed(x=>x+1) }
+        })
+    )
     await runPool(tasks, conc)
     setBusyCompress(false)
     if (fileInputRef.current) fileInputRef.current.value = ''
@@ -153,7 +216,7 @@ export default function App() {
           body: JSON.stringify({unit:{truck,trailer}, index:i+1, total:groups.length, media})
         })
         if (!r.ok) throw new Error(await r.text())
-        await sleep(600) // быстрее; 429 обрабатывается бэкендом
+        await sleep(600)
       }
       setSentOk(true)
     } catch(e:any) {
@@ -176,17 +239,27 @@ export default function App() {
     </div>
   )
 
-  // EN checklist (показываем для RU тоже)
-  const checklist = [
-    'Truck: front & both sides',
-    'Trailer: front & both sides',
-    'All tires (full set)',
-    'Tires: tread / damage / valve caps',
-    'Lights, reflectors, turn signals',
-    'Undercarriage, air lines, hoses',
-    'Documents: registration + annuals (truck & trailer)',
-    'Defects close-ups'
+  // ЧЕК-ЛИСТ — строго как ты дал
+  const checklistRU = [
+    'Трак: со всех сторон',
+    'Трейлер: со всех сторон',
+    'Все колеса: трака и трейлера',
+    'Лампы, фары, туманники',
+    'Шланги, тормоза, электрические и воздушные линии',
+    'Документы: аннуал инспекшн и регистрации трака и трейлера',
+    'Детальные фото повреждений, если есть',
   ]
+  const checklistEN = [
+    'Truck: all sides',
+    'Trailer: all sides',
+    'All tires: both truck and trailer tires',
+    'Lights, reflectors, turn signals',
+    'Hoses, brakes, air lines and electrical lines',
+    'Documents: registration + annual inspections (truck & trailer)',
+    'Damages close-ups if any',
+  ]
+  const checklistBlockTitle = ru ? 'Сфотографируйте обязательно:' : 'Please send:'
+  const checklist = ru ? checklistRU : checklistEN
 
   return (
     <div className="min-h-screen p-3"
@@ -223,10 +296,13 @@ export default function App() {
 
           {step===1 && (
             <div className="flex flex-col gap-3">
-              <div className="text-sm">{L.photosMin}: <b>{photos.length}</b></div>
+              <div className="text-sm">
+                {L.photosMin}: <b>{photos.length}</b>
+                {failed>0 && <span className="text-amber-300">  • повторные попытки: {failed}</span>}
+              </div>
 
               <div className="glass p-3 text-sm leading-tight">
-                <div className="opacity-80 mb-1">{ru ? 'Сфотографируйте обязательно:' : 'Please capture:'}</div>
+                <div className="opacity-80 mb-1">{checklistBlockTitle}</div>
                 <ul className="list-disc pl-5 space-y-1">
                   {checklist.map((it, i)=>(<li key={i}>{it}</li>))}
                 </ul>
@@ -236,7 +312,7 @@ export default function App() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="image/*"
+                  accept="image/*,.heic,.HEIC,.heif,.HEIF"
                   capture="environment"
                   multiple
                   className="hidden"
