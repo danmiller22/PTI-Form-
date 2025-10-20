@@ -26,14 +26,11 @@ export default function App() {
   const [sendText, setSendText] = useState('')
   const [sentOk, setSentOk]     = useState(false)
   const [errorText, setErrorText] = useState('')
-
-  const [dots, setDots] = useState('') // анимированные точки
+  const [dots, setDots] = useState('')
 
   useEffect(() => {
     if (!busyCompress && !busySend) { setDots(''); return }
-    const id = setInterval(() => {
-      setDots(prev => prev.length >= 3 ? '' : prev + '.')
-    }, 400)
+    const id = setInterval(() => setDots(p => p.length >= 3 ? '' : p + '.'), 350)
     return () => clearInterval(id)
   }, [busyCompress, busySend])
 
@@ -52,7 +49,7 @@ export default function App() {
     timeAuto:  ru ? 'Время (Америка/Чикаго)' : 'Time (America/Chicago)',
     next:      ru ? 'Далее' : 'Next',
     back:      ru ? 'Назад' : 'Back',
-    submit:    ru ? 'Отправить в Telegram' : 'Send to Telegram',
+    submit:    ru ? 'Отправить' : 'Send',
     submitted: ru ? 'Отправлено!' : 'Sent!',
     photosMin: ru ? 'Добавьте минимум 20 фото' : 'Add at least 20 photos',
     addPhotos: ru ? 'Добавить фото' : 'Add photos',
@@ -66,8 +63,8 @@ export default function App() {
     return true
   }
 
-  // ---------- FAST COMPRESSION (worker pool) ----------
-  function compressOnce(file: File, idx: number, quality: number, maxW: number, maxH: number, timeoutMs = 12000): Promise<PhotoItem> {
+  // ---------- FAST COMPRESSION (adaptive, worker pool) ----------
+  function compressOnce(file: File, idx: number, quality: number, maxW: number, maxH: number, timeoutMs = 10000): Promise<PhotoItem> {
     return new Promise<PhotoItem>((resolve, reject) => {
       const worker = new Worker(new URL('../worker/compress.ts', import.meta.url), { type: 'module' })
       const timer = setTimeout(() => { worker.terminate(); reject(new Error('timeout')) }, timeoutMs)
@@ -81,18 +78,21 @@ export default function App() {
       worker.postMessage({ file, quality, maxW, maxH })
     })
   }
-  async function compressWithRetry(file: File, idx: number): Promise<PhotoItem> {
-    const presets = [
-      { q: 0.62, w: 1280, h: 1280 },
-      { q: 0.55, w: 1280, h: 1280 },
-      { q: 0.5,  w: 1024, h: 1024 },
-      { q: 0.45, w: 1024, h: 1024 },
-    ]
-    for (const p of presets) {
-      try { return await compressOnce(file, idx, p.q, p.w, p.h) } catch {}
+
+  async function compressAuto(file: File, idx: number, targetKB = 200): Promise<PhotoItem> {
+    // старт быстро: 1200px, q=0.6
+    let w = 1200, h = 1200, q = 0.6
+    for (let pass = 0; pass < 4; pass++) {
+      const item = await compressOnce(file, idx, q, w, h)
+      if (item.bytes <= targetKB * 1024) return item
+      // уменьшать агрессивно
+      if (pass === 0) q = 0.52
+      else if (pass === 1) { q = 0.46; w = h = 1024 }
+      else { q = 0.42; w = h = 960 }
     }
-    return await compressOnce(file, idx, 0.4, 960, 960, 8000)
+    return await compressOnce(file, idx, 0.4, 900, 900, 9000)
   }
+
   async function runPool<T>(tasks: (() => Promise<T>)[], concurrency: number, onEach?: (res: T)=>void) {
     return new Promise<void>((resolve) => {
       let i = 0, active = 0
@@ -106,12 +106,14 @@ export default function App() {
       kick()
     })
   }
+
   const handleFiles = async (files: FileList | null) => {
     if (!files?.length) return
     setErrorText(''); setSentOk(false); setBusyCompress(true)
     const list = Array.from(files)
-    const tasks = list.map((f, idx)=> () => compressWithRetry(f, idx).then(item => setPhotos(p=>[...p,item])))
-    await runPool(tasks, 6)
+    const conc = Math.min(8, (navigator as any).hardwareConcurrency || 6) // быстрее
+    const tasks = list.map((f, idx)=> () => compressAuto(f, idx, 200).then(item => setPhotos(p=>[...p,item])))
+    await runPool(tasks, conc)
     setBusyCompress(false)
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
@@ -122,7 +124,7 @@ export default function App() {
     navigator.geolocation.getCurrentPosition(
       (pos)=>{ setGeoAllowed(true); setLoc({lat:pos.coords.latitude, lon:pos.coords.longitude, accuracy:pos.coords.accuracy}) },
       ()=> setGeoAllowed(false),
-      { enableHighAccuracy:true, timeout:8000, maximumAge:0 }
+      { enableHighAccuracy:true, timeout:7000, maximumAge:0 }
     )
   }
 
@@ -151,7 +153,7 @@ export default function App() {
           body: JSON.stringify({unit:{truck,trailer}, index:i+1, total:groups.length, media})
         })
         if (!r.ok) throw new Error(await r.text())
-        await sleep(1500)
+        await sleep(600) // быстрее; 429 обрабатывается бэкендом
       }
       setSentOk(true)
     } catch(e:any) {
@@ -161,7 +163,6 @@ export default function App() {
     }
   }
 
-  // ---------- UI ----------
   const Spinner = () => (
     <div className="flex flex-col items-center py-2">
       <div className="relative w-6 h-6 mb-1">
@@ -175,8 +176,8 @@ export default function App() {
     </div>
   )
 
-  // English checklist — показываем и в RU
-  const checklistEN = [
+  // EN checklist (показываем для RU тоже)
+  const checklist = [
     'Truck: front & both sides',
     'Trailer: front & both sides',
     'All tires (full set)',
@@ -186,7 +187,6 @@ export default function App() {
     'Documents: registration + annuals (truck & trailer)',
     'Defects close-ups'
   ]
-  const checklist = checklistEN
 
   return (
     <div className="min-h-screen p-3"
@@ -245,7 +245,7 @@ export default function App() {
                 {L.addPhotos}
               </label>
 
-              {(busyCompress) && <Spinner />}
+              {busyCompress && <Spinner />}
 
               <div className="flex justify-between mt-2">
                 <button className="btn glass h-12 px-5" onClick={()=>setStep(0)}>{L.back}</button>
