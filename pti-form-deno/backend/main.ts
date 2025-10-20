@@ -1,7 +1,7 @@
 const BOT = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID")!;
 const THREAD_ID = Deno.env.get("TELEGRAM_THREAD_ID");
-const DELAY = Number(Deno.env.get("GROUP_DELAY_MS") ?? "1500");
+const DELAY = Number(Deno.env.get("GROUP_DELAY_MS") ?? "600"); // быстрее по умолчанию
 const API = `https://api.telegram.org/bot${BOT}`;
 if (!BOT || !CHAT_ID) throw new Error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
 
@@ -59,19 +59,27 @@ async function sendMediaGroupOnce(payload: GroupPayload) {
   let json: any; try { json = JSON.parse(text); } catch { json = { ok: r.ok, raw: text }; }
   return { ok: r.ok, status: r.status, json, raw: text };
 }
+
 async function sendMediaGroupRetry(payload: GroupPayload, maxAttempts = 5) {
   let attempt = 0;
   while (attempt < maxAttempts) {
     attempt++;
     const res = await sendMediaGroupOnce(payload);
     if (res.ok) return res.json;
+
     const retryAfter =
       (res.json?.parameters?.retry_after as number | undefined) ??
       (res.json?.retry_after as number | undefined);
-    if (res.status === 429 && typeof retryAfter === "number") { await sleep(Math.ceil(retryAfter * 1000 * 1.2)); continue; }
+
+    if (res.status === 429 && typeof retryAfter === "number") {
+      await sleep(Math.ceil(retryAfter * 1000 * 1.15)); // адаптивно
+      continue;
+    }
     if (res.status === 400 && /Too Many Requests|retry_after/i.test(res.raw)) {
-      const m = res.raw.match(/retry_after[^\d]*(\d+)/i); const wait = m ? Number(m[1]) : 5;
-      await sleep(Math.ceil(wait * 1000 * 1.2)); continue;
+      const m = res.raw.match(/retry_after[^\d]*(\d+)/i);
+      const wait = m ? Number(m[1]) : 5;
+      await sleep(Math.ceil(wait * 1000 * 1.15));
+      continue;
     }
     throw new Error(`sendMediaGroup failed: ${res.raw}`);
   }
@@ -88,12 +96,9 @@ function buildSummaryMessage(b: Summary) {
   if (b.location?.lat != null && b.location?.lon != null) {
     const acc = typeof b.location.accuracy === "number" ? ` ±${Math.round(b.location.accuracy)}m` : "";
     L.push(`📍 [Map](${mapLink(b.location.lat, b.location.lon)}) \`${b.location.lat.toFixed(5)}, ${b.location.lon.toFixed(5)}${acc}\``);
-  } else if (b.location?.text) {
-    L.push(`📍 ${escapeMd(b.location.text)}`);
   }
-  // лаконичные инструкции для модерации
-  L.push(`— Photos: truck & trailer sides, *all tires*, lights, undercarriage, *registration + annuals* (truck & trailer), defects.`);
-  if (b.comment) { L.push(`— Notes: ${escapeMd(b.comment)}`); }
+  if (b.comment) L.push(`— Notes: ${escapeMd(b.comment)}`);
+  L.push(`— Photos: sides, *all tires*, lights, undercarriage, *registration + annuals* (truck & trailer), defects.`);
   return L.join('\n');
 }
 
@@ -120,7 +125,7 @@ Deno.serve(async (req) => {
     if (req.method === "POST" && url.pathname === "/relay/group") {
       const gp = (await req.json()) as GroupPayload;
       const result = await sendMediaGroupRetry(gp, 5);
-      await sleep(DELAY);
+      await sleep(DELAY); // короткая пауза, 429 ловим ретраями
       return json(200, { ok: true, result });
     }
 
